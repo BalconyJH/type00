@@ -94,9 +94,24 @@ async def execute_lottery_and_delete(lottery_id: str, scene_id: str):
         logger.info(f"Lottery {lottery_to_draw.keyword} has no participants to draw.")
         return
 
-    winner = secrets.choice(lottery_to_draw.participants)
+    # Get the number of winners to draw
+    num_winners = min(
+        lottery_to_draw.number_of_winners, len(lottery_to_draw.participants)
+    )
 
-    logger.info(f"Lottery {lottery_to_draw.keyword} has ended. Winner is {winner}.")
+    # Select the winners
+    winners = []
+    participants = lottery_to_draw.participants.copy()
+
+    for _ in range(num_winners):
+        if not participants:
+            break
+        winner = secrets.choice(participants)
+        winners.append(winner)
+        participants.remove(winner)  # Remove winner to avoid duplicate selection
+
+    winners_str = ", ".join(winners)
+    logger.info(f"Lottery {lottery_to_draw.keyword} has ended. Winners: {winners_str}")
 
     # Remove the lottery from existing data
     existing_data[scene_id] = [
@@ -107,25 +122,25 @@ async def execute_lottery_and_delete(lottery_id: str, scene_id: str):
         json.dump(existing_data, file, ensure_ascii=False, indent=4)
 
     logger.debug(f"Lottery {lottery_to_draw.keyword} has been deleted from data.")
-    await UniMessage(f"Lottery {lottery_to_draw.keyword} has ended. ").send(
-            target=Target.group(f"{scene_id}", SupportScope.qq_client),
-            bot=await get_bot(
-                bot_id=lottery_to_draw.bot_id, adapter=lottery_to_draw.adapter
-            ),
-        )
-    await (
-        UniMessage.template(
-            "Winner is {:At(user, target)}."
-        )
-        .format(target=winner)
-        .send(
-            target=Target.group(f"{scene_id}", SupportScope.qq_client),
-            bot=await get_bot(
-                bot_id=lottery_to_draw.bot_id, adapter=lottery_to_draw.adapter
-            ),
-        )
-    )
 
+    # Get bot for messaging
+    bot = await get_bot(bot_id=lottery_to_draw.bot_id, adapter=lottery_to_draw.adapter)
+
+    # Send end message
+    await UniMessage(f"Lottery {lottery_to_draw.keyword} has ended. ").send(
+        target=Target.group(f"{scene_id}", SupportScope.qq_client),
+        bot=bot,
+    )
+    msg = UniMessage("Winners are: ")
+
+    for winner in winners:
+        msg += UniMessage.template("{:At(user, target)}.").format(target=winner)
+    await msg.send(
+        target=Target.group(f"{scene_id}", SupportScope.qq_client),
+        bot=await get_bot(
+            bot_id=lottery_to_draw.bot_id, adapter=lottery_to_draw.adapter
+        ),
+    )
 
 
 def schedule_lottery_task(lottery_id: str, scene_id: str, end_time: datetime):
@@ -170,10 +185,13 @@ async def handle_new(
 
     if (
         session.member
-        and session.member.id != 1
+        and session.member.role
+        and session.member.role.level == 1
         and session.user.id not in get_driver().config.superusers
     ):
-        await lottery_cmd.finish("Only superusers can create a lottery")
+        await lottery_cmd.finish(
+            "Only members with an ID greater than 1 or superusers can create a lottery"
+        )
 
     if not keyword.available:
         await lottery_cmd.finish("No keyword provided")
@@ -216,7 +234,7 @@ async def handle_new(
         creator=session.user.id,
         scene=session.scene.id,
         keyword=_keyword,
-        participants_limits=number.result,
+        number_of_winners=number.result,
         start_time=_start_time.strftime("%Y-%m-%d %H:%M:%S"),
         end_time=_end_time.strftime("%Y-%m-%d %H:%M:%S"),
         bot_id=session.self_id,
@@ -236,8 +254,8 @@ async def handle_new(
     title = f"Lottery: {_keyword}" if keyword.available else "Lottery"
     await lottery_cmd.finish(
         f"{title} created with start time [{lottery.start_time}], end time"
-        f" [{lottery.end_time}], maximum {number.result} participants "
-        f"by {session.user.id}"
+        f" [{lottery.end_time}], number of winners: {number.result}"
+        f" by {session.user.id}"
     )
 
 
@@ -269,9 +287,25 @@ async def handle_join(
 
     if matching_lotteries:
         for lottery in matching_lotteries:
+            # Get the current time as an aware datetime
+            current_time = datetime.now(ZoneInfo("Asia/Shanghai"))
+
+            # Convert the lottery start time to an aware datetime
+            lottery_start_time = datetime.strptime(
+                lottery.start_time, "%Y-%m-%d %H:%M:%S"
+            ).replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+
+            # Check if the current time is before the lottery start time
+            if current_time < lottery_start_time:
+                await lottery_cmd.finish(
+                    f"The lottery '{_keyword}' has not started yet. It will start at {lottery.start_time}."
+                )
+
             # Check if the user is already a participant
             if session.user.id in lottery.participants:
-                await lottery_cmd.finish(f"You have already joined the lottery '{_keyword}'.")
+                await lottery_cmd.finish(
+                    f"You have already joined the lottery '{_keyword}'."
+                )
 
             # Add the user to the participants list
             lottery.participants.append(session.user.id)
@@ -286,7 +320,6 @@ async def handle_join(
         await lottery_cmd.finish(
             f"No lotteries found matching the keyword '{_keyword}'"
         )
-
 
 
 @lottery_cmd.assign("list")
@@ -314,12 +347,11 @@ async def handle_list(session: Session = UniSession()):
 
     lottery_list = [
         f"Keyword: {lottery.keyword}, Start: {lottery.start_time}, End: {lottery.end_time}, "
-        f"Participants: {len(lottery.participants)} / {lottery.participants_limits}"
+        f"Participants: {len(lottery.participants)}, Winners: {lottery.number_of_winners}"
         for lottery in lottery_data
     ]
 
     await lottery_cmd.finish("\n".join(lottery_list))
-
 
 
 @lottery_cmd.assign("delete")
@@ -338,10 +370,15 @@ async def handle_delete(
     if scene_id not in existing_data or not existing_data[scene_id]:
         await lottery_cmd.finish("No lottery found in this scene")
 
-    lottery_data: list[Lottery] = existing_data[scene_id]
+    # Convert each dictionary to a Lottery instance
+    lottery_data = [
+        Lottery.model_validate(lottery)  # Convert each dictionary to a Lottery instance
+        for lottery in existing_data[scene_id]
+    ]
 
     _keyword = keyword.result if keyword.available else ""
 
+    # Now, lottery is a Lottery instance, and we can access `keyword` correctly
     matching_lotteries = [
         lottery for lottery in lottery_data if _keyword in lottery.keyword
     ]
@@ -357,6 +394,7 @@ async def handle_delete(
                 )
 
             try:
+                # Remove the job for the lottery
                 scheduler.remove_job(lottery.id)
                 logger.info(
                     f"Job for lottery {lottery.keyword} with ID {lottery.id} has been "
@@ -365,6 +403,7 @@ async def handle_delete(
             except Exception as e:
                 logger.error(f"Failed to remove job for lottery {lottery.keyword}: {e}")
 
+            # Remove the lottery from the list and update the data
             existing_data[scene_id].remove(lottery.model_dump())
 
         with data_path.open("w", encoding="utf-8") as file:
